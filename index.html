@@ -1,0 +1,744 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Neural Zoom & Synapse Transfer</title>
+<style>
+  * {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+  }
+  html, body {
+    width: 100%;
+    height: 100%;
+    background: #000000;
+    overflow: hidden;
+  }
+  canvas {
+    position: fixed;
+    inset: 0;
+    width: 100vw;
+    height: 100vh;
+    display: block;
+  }
+</style>
+</head>
+<body>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+  const RENDER_WIDTH = 1080;
+  const RENDER_HEIGHT = 1320;
+  const TARGET_FPS = 60;
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x000000);
+
+  const camera = new THREE.PerspectiveCamera(48, RENDER_WIDTH / RENDER_HEIGHT, 0.1, 600);
+  camera.position.set(0, 0, 42);
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+  renderer.setSize(RENDER_WIDTH, RENDER_HEIGHT, false);
+  renderer.setPixelRatio(1);
+  document.body.appendChild(renderer.domElement);
+
+  const worldGroup = new THREE.Group();
+  scene.add(worldGroup);
+
+  let seed = 9517;
+  function rand() {
+    seed = (seed * 16807) % 2147483647;
+    return (seed - 1) / 2147483646;
+  }
+
+  const palette = [
+    new THREE.Color(0xff2a6d),
+    new THREE.Color(0xff9e00),
+    new THREE.Color(0xd9ff00),
+    new THREE.Color(0x00f5a0),
+    new THREE.Color(0x00e5ff),
+    new THREE.Color(0x9d4edd)
+  ];
+
+  function getSpectrumColor(t) {
+    const wrapped = ((t % 1) + 1) % 1;
+    const scaled = wrapped * palette.length;
+    const i0 = Math.floor(scaled) % palette.length;
+    const i1 = (i0 + 1) % palette.length;
+    const frac = scaled - Math.floor(scaled);
+    return palette[i0].clone().lerp(palette[i1], frac);
+  }
+
+  // --- 1. Thick 3D Ribbon Geometry for Clear, Bold Dendrites & Axons ---
+  const ribPositions = [];
+  const ribColors = [];
+  const ribMeta = [];
+  const ribIndices = [];
+
+  const sparkPositions = [];
+  const sparkColors = [];
+  const sparkMeta = [];
+  const sparkScales = [];
+  const sparkPhases = [];
+
+  function pushThickBranch(pts, fStart, fEnd, bSeed, zone, startRadius, endRadius) {
+    if (pts.length < 2) return;
+    const baseVert = ribPositions.length / 3;
+
+    for (let i = 0; i < pts.length; i++) {
+      const u = i / (pts.length - 1);
+      const fVal = THREE.MathUtils.lerp(fStart, fEnd, u);
+      const col = getSpectrumColor(fVal * 1.45 + bSeed * 0.65 + zone * 0.25);
+      const r = THREE.MathUtils.lerp(startRadius, endRadius, Math.pow(u, 0.75));
+
+      const prev = pts[Math.max(0, i - 1)];
+      const next = pts[Math.min(pts.length - 1, i + 1)];
+      const tang = new THREE.Vector3().subVectors(next, prev);
+      if (tang.lengthSq() < 0.00001) tang.set(1, 0, 0);
+      tang.normalize();
+
+      const upRef = Math.abs(tang.y) < 0.9 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0);
+      const side1 = new THREE.Vector3().crossVectors(tang, upRef).normalize();
+      const side2 = new THREE.Vector3().crossVectors(tang, side1).normalize();
+
+      const ringOffsets = [
+        side1.clone().multiplyScalar(r),
+        side2.clone().multiplyScalar(r),
+        side1.clone().multiplyScalar(-r),
+        side2.clone().multiplyScalar(-r)
+      ];
+
+      for (let k = 0; k < 4; k++) {
+        ribPositions.push(
+          pts[i].x + ringOffsets[k].x,
+          pts[i].y + ringOffsets[k].y,
+          pts[i].z + ringOffsets[k].z
+        );
+        ribColors.push(col.r, col.g, col.b);
+        ribMeta.push(fVal, bSeed, zone);
+      }
+
+      if (i > 0) {
+        const rPrev = baseVert + (i - 1) * 4;
+        const rCurr = baseVert + i * 4;
+        for (let k = 0; k < 4; k++) {
+          const kn = (k + 1) % 4;
+          ribIndices.push(rPrev + k, rCurr + k, rCurr + kn);
+          ribIndices.push(rPrev + k, rCurr + kn, rPrev + kn);
+        }
+      }
+    }
+
+    const step = Math.max(1, Math.floor(pts.length / 4));
+    for (let i = 0; i < pts.length; i += step) {
+      const u = i / (pts.length - 1);
+      const fVal = THREE.MathUtils.lerp(fStart, fEnd, u);
+      const col = getSpectrumColor(fVal * 1.45 + bSeed * 0.65 + zone * 0.25);
+      sparkPositions.push(pts[i].x, pts[i].y, pts[i].z);
+      sparkColors.push(col.r, col.g, col.b);
+      sparkMeta.push(fVal, bSeed, zone);
+      sparkScales.push(0.8 + rand() * 0.9);
+      sparkPhases.push(rand() * Math.PI * 2);
+    }
+  }
+
+  function growDendriteTree(startPt, baseDir, length, depth, fStart, fEnd, bSeed, zone, r0, r1) {
+    const steps = depth === 0 ? 10 : depth === 1 ? 8 : 6;
+    const pts = [startPt.clone()];
+    const cur = startPt.clone();
+    const d = baseDir.clone().normalize();
+    const axis = new THREE.Vector3(rand() - 0.5, rand() - 0.5, rand() - 0.5).normalize();
+
+    for (let i = 1; i <= steps; i++) {
+      const u = i / steps;
+      d.applyAxisAngle(axis, (rand() - 0.5) * 0.22);
+      d.normalize();
+      cur.addScaledVector(d, (length / steps) * (1.0 - u * 0.14));
+      pts.push(cur.clone());
+    }
+
+    pushThickBranch(pts, fStart, fEnd, bSeed, zone, r0, r1);
+
+    if (depth < 2) {
+      for (let c = 0; c < 2; c++) {
+        const splitIdx = Math.max(2, Math.min(pts.length - 1, Math.floor(pts.length * (0.5 + c * 0.35))));
+        const splitPt = pts[splitIdx];
+        const ang = (c === 0 ? 0.52 : -0.52) + (rand() - 0.5) * 0.2;
+        const cDir = d.clone()
+          .applyAxisAngle(new THREE.Vector3(0, 0, 1), ang)
+          .applyAxisAngle(new THREE.Vector3(0, 1, 0), (rand() - 0.5) * 0.65)
+          .normalize();
+
+        const nextFStart = THREE.MathUtils.lerp(fStart, fEnd, splitIdx / steps);
+        const nextFEnd = Math.min(1.0, nextFStart + (fEnd - nextFStart) * 0.85);
+        growDendriteTree(
+          splitPt,
+          cDir,
+          length * 0.64,
+          depth + 1,
+          nextFStart,
+          nextFEnd,
+          (bSeed + 0.19 * (c + 1)) % 1.0,
+          zone,
+          r1,
+          r1 * 0.55
+        );
+      }
+    }
+  }
+
+  function buildBiologicalNeuron(somaPos, scale, axonDirVec, fStart, fEnd, bSeed, zone) {
+    const dendriteCount = 8;
+    for (let i = 0; i < dendriteCount; i++) {
+      const ang = (i / dendriteCount) * Math.PI * 2 + (rand() - 0.5) * 0.22;
+      const zTilt = (rand() - 0.5) * 0.8;
+      const dir = new THREE.Vector3(Math.cos(ang), Math.sin(ang), zTilt).normalize();
+      const origin = somaPos.clone().addScaledVector(dir, 0.25 * scale);
+      growDendriteTree(
+        origin,
+        dir,
+        (1.45 + rand() * 0.5) * scale,
+        0,
+        fStart,
+        THREE.MathUtils.lerp(fStart, fEnd, 0.55),
+        (bSeed + i * 0.11) % 1.0,
+        zone,
+        0.095 * scale,
+        0.045 * scale
+      );
+    }
+
+    const axonLen = 3.3 * scale;
+    const axonPts = [];
+    const axonSteps = 16;
+    const aDir = axonDirVec.clone().normalize();
+    const perp = new THREE.Vector3(-aDir.y, aDir.x, 0.2).normalize();
+
+    for (let i = 0; i <= axonSteps; i++) {
+      const u = i / axonSteps;
+      const p = somaPos.clone()
+        .addScaledVector(aDir, axonLen * u)
+        .addScaledVector(perp, Math.sin(u * Math.PI * 2.2) * 0.18 * scale * u);
+      axonPts.push(p);
+    }
+    const midFlow = THREE.MathUtils.lerp(fStart, fEnd, 0.65);
+    pushThickBranch(axonPts, midFlow, fEnd, bSeed, zone, 0.11 * scale, 0.06 * scale);
+
+    const axonTip = axonPts[axonPts.length - 1];
+    for (let t = 0; t < 4; t++) {
+      const tAng = (t - 1.5) * 0.42 + (rand() - 0.5) * 0.15;
+      const tDir = aDir.clone()
+        .applyAxisAngle(new THREE.Vector3(0, 0, 1), tAng)
+        .applyAxisAngle(new THREE.Vector3(0, 1, 0), (rand() - 0.5) * 0.5)
+        .normalize();
+      growDendriteTree(
+        axonTip,
+        tDir,
+        0.8 * scale,
+        1,
+        THREE.MathUtils.lerp(fStart, fEnd, 0.8),
+        fEnd,
+        (bSeed + t * 0.14) % 1.0,
+        zone,
+        0.055 * scale,
+        0.025 * scale
+      );
+    }
+  }
+
+  // --- Hero Pair: Neuron A (Left) -> Synaptic Gap -> Neuron B (Right) ---
+  const heroSomaA = new THREE.Vector3(-4.5, -0.35, 0.2);
+  const heroSomaB = new THREE.Vector3(2.8, 0.25, -0.1);
+
+  buildBiologicalNeuron(heroSomaA, 1.05, new THREE.Vector3(0.96, 0.2, -0.05), 0.0, 0.48, 0.15, 1.0);
+  buildBiologicalNeuron(heroSomaB, 1.12, new THREE.Vector3(0.92, 0.36, 0.1), 0.52, 1.0, 0.65, 2.0);
+
+  // --- Surrounding Network Neurons ---
+  const networkCenters = [
+    new THREE.Vector3(-9.0, 4.5, -2.0),
+    new THREE.Vector3(-1.5, 6.2, -3.5),
+    new THREE.Vector3(7.2, 5.4, -2.0),
+    new THREE.Vector3(-9.5, -4.8, -1.8),
+    new THREE.Vector3(-1.2, -6.0, -3.0),
+    new THREE.Vector3(7.8, -4.6, -2.2),
+    new THREE.Vector3(-13.5, 0.4, -4.5),
+    new THREE.Vector3(12.5, 0.6, -4.0),
+    new THREE.Vector3(-5.8, 9.5, -5.5),
+    new THREE.Vector3(4.8, -9.2, -5.0),
+    new THREE.Vector3(0.0, 1.8, -6.5),
+    new THREE.Vector3(-4.0, -2.8, -6.0),
+    new THREE.Vector3(9.5, 9.0, -7.5),
+    new THREE.Vector3(-10.5, -9.5, -7.0)
+  ];
+
+  networkCenters.forEach((pos, i) => {
+    const ang = (i / networkCenters.length) * Math.PI * 2;
+    const axDir = new THREE.Vector3(Math.cos(ang), Math.sin(ang), (rand() - 0.5) * 0.4);
+    buildBiologicalNeuron(pos, 1.0, axDir, 0.0, 1.0, i / networkCenters.length, 0.0);
+  });
+
+  for (let i = 0; i < networkCenters.length; i++) {
+    for (let j = i + 1; j < networkCenters.length; j++) {
+      const p1 = networkCenters[i];
+      const p2 = networkCenters[j];
+      if (p1.distanceTo(p2) < 12.0) {
+        const mid = p1.clone().add(p2).multiplyScalar(0.5);
+        mid.x += (rand() - 0.5) * 1.8;
+        mid.y += (rand() - 0.5) * 1.8;
+        mid.z += (rand() - 0.5) * 1.2;
+        const curve = new THREE.QuadraticBezierCurve3(p1, mid, p2);
+        pushThickBranch(curve.getPoints(12), 0.1, 0.9, (i + j) * 0.13, 0.0, 0.05, 0.05);
+      }
+    }
+  }
+
+  // --- 2. 3D Depth Reference Particles ---
+  const depthCount = 1400;
+  const depthPos = new Float32Array(depthCount * 3);
+  const depthCol = new Float32Array(depthCount * 3);
+  const depthPhase = new Float32Array(depthCount);
+  for (let i = 0; i < depthCount; i++) {
+    const i3 = i * 3;
+    depthPos[i3] = (Math.random() - 0.5) * 34;
+    depthPos[i3 + 1] = (Math.random() - 0.5) * 38;
+    depthPos[i3 + 2] = -14 + Math.random() * 24;
+    const c = getSpectrumColor(Math.random());
+    depthCol[i3] = c.r;
+    depthCol[i3 + 1] = c.g;
+    depthCol[i3 + 2] = c.b;
+    depthPhase[i] = Math.random() * Math.PI * 2;
+  }
+
+  const depthGeo = new THREE.BufferGeometry();
+  depthGeo.setAttribute('position', new THREE.BufferAttribute(depthPos, 3));
+  depthGeo.setAttribute('aColor', new THREE.BufferAttribute(depthCol, 3));
+  depthGeo.setAttribute('aPhase', new THREE.BufferAttribute(depthPhase, 1));
+
+  const depthMat = new THREE.ShaderMaterial({
+    uniforms: {
+      uTime: { value: 0 }
+    },
+    vertexShader: `
+      uniform float uTime;
+      attribute vec3 aColor;
+      attribute float aPhase;
+      varying vec3 vColor;
+      varying float vAlpha;
+
+      void main() {
+        vec3 pos = position;
+        pos.y += sin(uTime * 0.8 + aPhase) * 0.25;
+        vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+        gl_Position = projectionMatrix * mvPosition;
+
+        float dist = max(-mvPosition.z, 0.6);
+        gl_PointSize = clamp(120.0 / dist, 1.5, 26.0);
+        float nearFade = smoothstep(0.6, 2.5, -mvPosition.z);
+        vColor = aColor;
+        vAlpha = (0.28 + 0.18 * sin(uTime * 2.5 + aPhase)) * nearFade;
+      }
+    `,
+    fragmentShader: `
+      varying vec3 vColor;
+      varying float vAlpha;
+      void main() {
+        if (vAlpha <= 0.005) discard;
+        float d = length(gl_PointCoord - vec2(0.5));
+        if (d > 0.5) discard;
+        float glow = pow(1.0 - d * 2.0, 2.2);
+        gl_FragColor = vec4(vColor, glow * vAlpha);
+      }
+    `,
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending
+  });
+
+  const depthPoints = new THREE.Points(depthGeo, depthMat);
+  worldGroup.add(depthPoints);
+
+  // --- 3. Synaptic Impulse Sparks Jumping Across the Gap ---
+  const jumpCount = 360;
+  const jumpPos = new Float32Array(jumpCount * 3);
+  const jumpCol = new Float32Array(jumpCount * 3);
+  const jumpSeeds = new Float32Array(jumpCount);
+  const jumpOffs = new Float32Array(jumpCount);
+
+  for (let i = 0; i < jumpCount; i++) {
+    const i3 = i * 3;
+    jumpPos[i3] = (Math.random() - 0.5) * 1.8;
+    jumpPos[i3 + 1] = (Math.random() - 0.5) * 2.4;
+    jumpPos[i3 + 2] = (Math.random() - 0.5) * 1.2;
+    const c = getSpectrumColor(Math.random());
+    jumpCol[i3] = c.r;
+    jumpCol[i3 + 1] = c.g;
+    jumpCol[i3 + 2] = c.b;
+    jumpSeeds[i] = Math.random();
+    jumpOffs[i] = Math.random();
+  }
+
+  const jumpGeo = new THREE.BufferGeometry();
+  jumpGeo.setAttribute('position', new THREE.BufferAttribute(jumpPos, 3));
+  jumpGeo.setAttribute('aColor', new THREE.BufferAttribute(jumpCol, 3));
+  jumpGeo.setAttribute('aSeed', new THREE.BufferAttribute(jumpSeeds, 1));
+  jumpGeo.setAttribute('aOff', new THREE.BufferAttribute(jumpOffs, 1));
+
+  const jumpMat = new THREE.ShaderMaterial({
+    uniforms: {
+      uTime: { value: 0 }
+    },
+    vertexShader: `
+      uniform float uTime;
+      attribute vec3 aColor;
+      attribute float aSeed;
+      attribute float aOff;
+      varying vec3 vColor;
+      varying float vAlpha;
+
+      void main() {
+        float cycle = fract(uTime * 0.36 - aSeed * 0.12);
+        float activeTransfer = exp(-pow((cycle - 0.5) * 6.5, 2.0));
+        float tJump = fract(uTime * 2.8 + aOff);
+
+        vec3 pos = position;
+        pos.x = mix(-1.25, 0.55, tJump);
+        pos.y += sin(tJump * 3.14159 + aSeed * 12.0) * 0.45;
+        pos.z += cos(tJump * 3.14159 + aSeed * 8.0) * 0.35;
+
+        vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+        gl_Position = projectionMatrix * mvPosition;
+        gl_PointSize = clamp((190.0 * (0.45 + activeTransfer * 1.3)) / max(-mvPosition.z, 0.7), 2.0, 36.0);
+
+        float nearFade = smoothstep(0.6, 2.0, -mvPosition.z);
+        vColor = mix(aColor, vec3(1.0), activeTransfer * 0.65);
+        vAlpha = activeTransfer * nearFade * 0.98;
+      }
+    `,
+    fragmentShader: `
+      varying vec3 vColor;
+      varying float vAlpha;
+      void main() {
+        if (vAlpha <= 0.005) discard;
+        float d = length(gl_PointCoord - vec2(0.5));
+        if (d > 0.5) discard;
+        float glow = pow(1.0 - d * 2.0, 2.0);
+        gl_FragColor = vec4(mix(vColor, vec3(1.0), glow * 0.55), glow * vAlpha);
+      }
+    `,
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending
+  });
+
+  const jumpSparks = new THREE.Points(jumpGeo, jumpMat);
+  worldGroup.add(jumpSparks);
+
+  // --- 4. Thick 3D Neuron Ribbon Mesh & Sparks ---
+  const ribGeo = new THREE.BufferGeometry();
+  ribGeo.setAttribute('position', new THREE.Float32BufferAttribute(ribPositions, 3));
+  ribGeo.setAttribute('aColor', new THREE.Float32BufferAttribute(ribColors, 3));
+  ribGeo.setAttribute('aMeta', new THREE.Float32BufferAttribute(ribMeta, 3));
+  ribGeo.setIndex(ribIndices);
+
+  const ribMat = new THREE.ShaderMaterial({
+    uniforms: {
+      uTime: { value: 0 }
+    },
+    vertexShader: `
+      uniform float uTime;
+      attribute vec3 aColor;
+      attribute vec3 aMeta;
+      varying vec3 vColor;
+      varying float vPulse;
+
+      void main() {
+        float f = aMeta.x;
+        float s = aMeta.y;
+        vec3 pos = position;
+        pos.y += sin(uTime * 1.5 + f * 8.0 + s * 10.0) * 0.025;
+        pos.z += cos(uTime * 1.3 + f * 7.0 + s * 10.0) * 0.025;
+
+        vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+        gl_Position = projectionMatrix * mvPosition;
+
+        float wave = fract(uTime * 0.36 - s * 0.1);
+        float dist = abs(f - wave);
+        float pulse = exp(-dist * dist * 85.0);
+
+        float total = clamp(pulse, 0.0, 1.5);
+        vPulse = total;
+
+        vec3 baseCol = mix(vec3(0.28, 0.42, 0.55), aColor, 0.72);
+        vec3 brightCol = mix(aColor, vec3(1.0), clamp(total * 0.55, 0.0, 0.75));
+        vColor = mix(baseCol, brightCol, clamp(total * 1.2, 0.0, 1.0));
+      }
+    `,
+    fragmentShader: `
+      varying vec3 vColor;
+      varying float vPulse;
+      void main() {
+        float alpha = clamp(0.45 + vPulse * 0.55, 0.0, 1.0);
+        if (alpha <= 0.004) discard;
+        gl_FragColor = vec4(vColor * (0.95 + vPulse * 0.85), alpha);
+      }
+    `,
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    side: THREE.DoubleSide
+  });
+
+  const neuronRibbons = new THREE.Mesh(ribGeo, ribMat);
+  worldGroup.add(neuronRibbons);
+
+  const sparkGeo = new THREE.BufferGeometry();
+  sparkGeo.setAttribute('position', new THREE.Float32BufferAttribute(sparkPositions, 3));
+  sparkGeo.setAttribute('aColor', new THREE.Float32BufferAttribute(sparkColors, 3));
+  sparkGeo.setAttribute('aMeta', new THREE.Float32BufferAttribute(sparkMeta, 3));
+  sparkGeo.setAttribute('aScale', new THREE.Float32BufferAttribute(sparkScales, 1));
+  sparkGeo.setAttribute('aPhase', new THREE.Float32BufferAttribute(sparkPhases, 1));
+
+  const sparkMat = new THREE.ShaderMaterial({
+    uniforms: {
+      uTime: { value: 0 }
+    },
+    vertexShader: `
+      uniform float uTime;
+      attribute vec3 aColor;
+      attribute vec3 aMeta;
+      attribute float aScale;
+      attribute float aPhase;
+      varying vec3 vColor;
+      varying float vAlpha;
+
+      void main() {
+        float f = aMeta.x;
+        float s = aMeta.y;
+        vec3 pos = position;
+        pos.y += sin(uTime * 1.5 + f * 8.0 + s * 10.0) * 0.025;
+        pos.z += cos(uTime * 1.3 + f * 7.0 + s * 10.0) * 0.025;
+
+        vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+        gl_Position = projectionMatrix * mvPosition;
+
+        float wave = fract(uTime * 0.36 - s * 0.1);
+        float pulse = exp(-pow((f - wave) * 8.5, 2.0));
+
+        float dist = max(-mvPosition.z, 0.7);
+        gl_PointSize = clamp(((aScale * (0.7 + pulse * 1.4)) * 240.0) / dist, 2.0, 48.0);
+
+        float nearFade = smoothstep(0.6, 2.0, -mvPosition.z);
+        vColor = mix(aColor, vec3(1.0), clamp(pulse * 0.55, 0.0, 0.75));
+        vAlpha = clamp((0.35 + pulse * 0.65) * (0.8 + 0.2 * sin(uTime * 4.0 + aPhase)), 0.0, 1.0) * nearFade;
+      }
+    `,
+    fragmentShader: `
+      varying vec3 vColor;
+      varying float vAlpha;
+      void main() {
+        if (vAlpha <= 0.005) discard;
+        float d = length(gl_PointCoord - vec2(0.5));
+        if (d > 0.5) discard;
+        float glow = pow(1.0 - d * 2.0, 2.0);
+        vec3 col = mix(vColor, vec3(1.0), pow(glow, 2.8) * 0.55);
+        gl_FragColor = vec4(col, glow * vAlpha);
+      }
+    `,
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending
+  });
+
+  const sparkPoints = new THREE.Points(sparkGeo, sparkMat);
+  worldGroup.add(sparkPoints);
+
+  function createGlowTexture() {
+    const c = document.createElement('canvas');
+    c.width = 256;
+    c.height = 256;
+    const gctx = c.getContext('2d');
+    const g = gctx.createRadialGradient(128, 128, 2, 128, 128, 126);
+    g.addColorStop(0, 'rgba(255, 255, 255, 1.0)');
+    g.addColorStop(0.22, 'rgba(255, 235, 180, 0.85)');
+    g.addColorStop(0.55, 'rgba(0, 229, 255, 0.28)');
+    g.addColorStop(1, 'rgba(0, 0, 0, 0.0)');
+    gctx.fillStyle = g;
+    gctx.fillRect(0, 0, 256, 256);
+    return new THREE.CanvasTexture(c);
+  }
+
+  const glowTex = createGlowTexture();
+  const spriteMatA = new THREE.SpriteMaterial({
+    map: glowTex,
+    transparent: true,
+    opacity: 0.65,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false
+  });
+  const spriteA = new THREE.Sprite(spriteMatA);
+  spriteA.position.copy(heroSomaA);
+  worldGroup.add(spriteA);
+
+  const spriteMatB = new THREE.SpriteMaterial({
+    map: glowTex,
+    transparent: true,
+    opacity: 0.65,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false
+  });
+  const spriteB = new THREE.Sprite(spriteMatB);
+  spriteB.position.copy(heroSomaB);
+  worldGroup.add(spriteB);
+
+  // --- 5. Optional Recorder ('R' to start/stop, 'Space' to reset) ---
+  let elapsed = 0;
+  let lastNow = performance.now();
+  let isRecording = false;
+  let mediaRecorder = null;
+  let recordedChunks = [];
+
+  function resetAnimation() {
+    elapsed = 0;
+    lastNow = performance.now();
+    ribMat.uniforms.uTime.value = 0;
+    sparkMat.uniforms.uTime.value = 0;
+    jumpMat.uniforms.uTime.value = 0;
+    depthMat.uniforms.uTime.value = 0;
+  }
+
+  function startRecording() {
+    if (isRecording) return;
+    resetAnimation();
+    recordedChunks = [];
+
+    const stream = renderer.domElement.captureStream(TARGET_FPS);
+    const mimeTypes = ['video/mp4;codecs=avc1.42E01E', 'video/mp4', 'video/webm;codecs=vp9', 'video/webm'];
+    const selectedMime = mimeTypes.find(m => MediaRecorder.isTypeSupported(m)) || '';
+    const ext = selectedMime.includes('mp4') ? 'mp4' : 'webm';
+
+    try {
+      mediaRecorder = new MediaRecorder(stream, {
+        mimeType: selectedMime || undefined,
+        videoBitsPerSecond: 14000000
+      });
+    } catch (e) {
+      mediaRecorder = new MediaRecorder(stream);
+    }
+
+    mediaRecorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) recordedChunks.push(e.data);
+    };
+
+    mediaRecorder.onstop = () => {
+      const blob = new Blob(recordedChunks, { type: selectedMime || 'video/webm' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `Neural-Zoom-Synapse.${ext}`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+      isRecording = false;
+    };
+
+    isRecording = true;
+    mediaRecorder.start(100);
+  }
+
+  function stopRecording() {
+    if (!isRecording) return;
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+      mediaRecorder.stop();
+    }
+    isRecording = false;
+  }
+
+  window.addEventListener('keydown', (e) => {
+    if (e.code === 'KeyR') {
+      if (!isRecording) startRecording();
+      else stopRecording();
+    }
+    if (e.code === 'Space' && !isRecording) resetAnimation();
+  });
+
+  function smoothstep(x) {
+    const t = Math.min(Math.max(x, 0), 1);
+    return t * t * (3 - 2 * t);
+  }
+
+  const lookPos = new THREE.Vector3(0, 0, 0);
+
+  // --- 6. Endless Seamless Zoom Cycle ---
+  function animate(now) {
+    requestAnimationFrame(animate);
+    const delta = Math.min((now - lastNow) / 1000, 0.05);
+    lastNow = now;
+    elapsed += delta;
+
+    const t = elapsed;
+    ribMat.uniforms.uTime.value = t;
+    sparkMat.uniforms.uTime.value = t;
+    jumpMat.uniforms.uTime.value = t;
+    depthMat.uniforms.uTime.value = t;
+
+    const wave = (t * 0.36) % 1.0;
+    const pulseA = Math.exp(-Math.pow((wave - 0.35) * 4.5, 2.0));
+    const pulseB = Math.exp(-Math.pow((wave - 0.72) * 4.5, 2.0));
+
+    spriteA.scale.set(2.4 + pulseA * 3.2, 2.4 + pulseA * 3.2, 1);
+    spriteMatA.opacity = 0.45 + pulseA * 0.55;
+
+    spriteB.scale.set(2.6 + pulseB * 3.5, 2.6 + pulseB * 3.5, 1);
+    spriteMatB.opacity = 0.45 + pulseB * 0.55;
+
+    // Seamless 26s continuous zoom loop: wide network -> two-neuron transfer -> single neuron zoom -> pull back
+    const cycle = (t % 26.0) / 26.0;
+    let camX = 0, camY = 0, camZ = 42;
+    let tgtX = 0, tgtY = 0, tgtZ = 0;
+
+    if (cycle < 0.35) {
+      const p = smoothstep(cycle / 0.35);
+      camX = THREE.MathUtils.lerp(0, -0.85, p) + Math.sin(t * 0.35) * 1.4 * (1 - p * 0.6);
+      camY = THREE.MathUtils.lerp(1.5, -0.05, p) + Math.cos(t * 0.28) * 1.1 * (1 - p * 0.6);
+      camZ = THREE.MathUtils.lerp(42.0, 14.5, p);
+      tgtX = THREE.MathUtils.lerp(0, -0.85, p);
+      tgtY = THREE.MathUtils.lerp(0.4, -0.05, p);
+    } else if (cycle < 0.68) {
+      const p = (cycle - 0.35) / 0.33;
+      camX = -0.85 + Math.sin(p * Math.PI * 2.0) * 0.75;
+      camY = -0.05 + Math.cos(p * Math.PI * 1.5) * 0.45;
+      camZ = 14.5 - Math.sin(p * Math.PI) * 2.2;
+      tgtX = -0.85 + Math.sin(p * Math.PI * 2.0) * 0.3;
+      tgtY = -0.05;
+    } else if (cycle < 0.88) {
+      const p = smoothstep((cycle - 0.68) / 0.20);
+      camX = THREE.MathUtils.lerp(-0.85, 3.1, p) + Math.sin(t * 0.65) * 0.25;
+      camY = THREE.MathUtils.lerp(-0.05, 0.35, p) + Math.cos(t * 0.55) * 0.2;
+      camZ = THREE.MathUtils.lerp(14.5, 4.4, p);
+      tgtX = THREE.MathUtils.lerp(-0.85, 2.95, p);
+      tgtY = THREE.MathUtils.lerp(-0.05, 0.28, p);
+      tgtZ = -0.1;
+    } else {
+      const p = smoothstep((cycle - 0.88) / 0.12);
+      camX = THREE.MathUtils.lerp(3.1, 0, p);
+      camY = THREE.MathUtils.lerp(0.35, 1.5, p);
+      camZ = THREE.MathUtils.lerp(4.4, 42.0, p);
+      tgtX = THREE.MathUtils.lerp(2.95, 0, p);
+      tgtY = THREE.MathUtils.lerp(0.28, 0.4, p);
+      tgtZ = THREE.MathUtils.lerp(-0.1, 0, p);
+    }
+
+    camera.position.set(camX, camY, camZ);
+    lookPos.set(tgtX, tgtY, tgtZ);
+    camera.lookAt(lookPos);
+
+    renderer.render(scene, camera);
+  }
+
+  requestAnimationFrame(animate);
+</script>
+</body>
+</html>
